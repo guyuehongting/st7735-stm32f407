@@ -1,0 +1,28 @@
+# Keil MDK
+*.uvguix.*
+*.uvoptx
+*.uvprojx.bak
+Objects/
+Listings/
+DebugConfig/
+RTE/
+
+# 编译产物
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.lnp
+*.dep
+*.iex
+*.htm
+*.build_log.htm
+
+# 系统
+Thumbs.db
+.DS_Store
+desktop.ini
