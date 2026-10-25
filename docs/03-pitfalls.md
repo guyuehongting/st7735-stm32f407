@@ -280,30 +280,39 @@ static void TFT_ParkPinsHigh(void)
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOE_CLK_ENABLE();
 
-    gi.Mode  = GPIO_MODE_OUTPUT_PP;
-    gi.Pull  = GPIO_NOPULL;
+    gi.Mode  = GPIO_MODE_INPUT;      /* ★ 输入 + 上拉，不是推挽输出 */
+    gi.Pull  = GPIO_PULLUP;
     gi.Speed = GPIO_SPEED_FREQ_LOW;
 
     /* GPIOE: PE2 PE3 PE4 PE5 PE6 */
     gi.Pin = GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6;
     HAL_GPIO_Init(GPIOE, &gi);
-    HAL_GPIO_WritePin(GPIOE, gi.Pin, GPIO_PIN_SET);
 
     /* GPIOC: PC0 PC1 PC2 PC13（PC3=MOSI / PC14=DC / PC15=CS 不能用） */
     gi.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_13;
     HAL_GPIO_Init(GPIOC, &gi);
-    HAL_GPIO_WritePin(GPIOC, gi.Pin, GPIO_PIN_SET);
 
     /* GPIOB: PB13 PB15（PB10=SCK 不能用） */
     gi.Pin = GPIO_PIN_13 | GPIO_PIN_15;
     HAL_GPIO_Init(GPIOB, &gi);
-    HAL_GPIO_WritePin(GPIOB, gi.Pin, GPIO_PIN_SET);
 }
 ```
 
 在 `TFT_Init()` 里、`SPI2_Init()` 之前调用一次。
 
-**顺带的好处**：BLK（背光）如果在这几个脚里，也会被拉高 → 背光常亮。
+#### 为什么用「输入 + 上拉」而不是「推挽输出高」
+
+推挽输出高虽然更"硬"，但这几根脚在你的板子上另有用途：
+
+| 引脚 | 板上的用途 | 推挽输出高的后果 |
+|---|---|---|
+| PE2~PE5 | 按键 | 按键按下时 = 对地短路，瞬间大电流 |
+| PB13 | 电机方向 | 可能把电机驱动打开，电流冲击 + 干扰 |
+
+输入上拉只有几十微安，既能给高阻的 RES 输入一个确定的高电平，
+又绝不会短路、也不会把电机打开。对 RES 这种高阻输入来说完全够用。
+
+**实测结论：换成输入上拉后，屏幕一路正常计数到 300+，问题解决。**
 
 ### 第二道保险：每段演示前重新初始化
 

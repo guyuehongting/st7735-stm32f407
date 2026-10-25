@@ -73,6 +73,12 @@
 /* 串口进度打印（USART1，PA9=TX PA10=RX，115200）。不需要就改 0 */
 #define USE_SERIAL      1
 
+/* 诊断模式：
+ *   1 = 跑「静态保持」诊断（排查"跑几秒变白"用，会占满整个程序）
+ *   0 = 跑正常的 7 段演示                                    <- 默认
+ *   2026-10-25 已实测通过：屏幕能一路计数到 300+，说明 RES 问题已解决。  */
+#define RUN_DIAG        0
+
 /*==============================================================================
  *                              尺寸 / 颜色
  *============================================================================*/
@@ -338,6 +344,19 @@ static void TFT_SetWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
  *
  *   顺带的好处：BLK（背光）如果在这几个脚里，也会被拉高 -> 背光常亮。
  *---------------------------------------------------------------------------*/
+/*------------------------------------------------------------------------------
+ * ★★ 把所有「没用到但可能是 RES / BLK」的脚都拉到高电平
+ *
+ *   为什么需要：
+ *     模块的 RES 我们没接（靠 0x01 SWRESET 软复位）。RES 悬空时电平由噪声决定，
+ *     被拉低一次面板就硬复位 -> 显示关闭 -> 常白屏 -> 之后写什么都没用。
+ *
+ *   为什么用「输入 + 上拉」而不是「推挽输出高」：
+ *     · PE2~PE5 是按键，如果按键正好被按住，推挽输出高 = 对地短路，电流很大
+ *     · PB13 是电机方向脚，推挽输出高可能把电机驱动打开，电流冲击 + 干扰
+ *     输入上拉只有几十微安，既能给 RES 一个确定的高电平，又绝不会短路、
+ *     也不会把电机打开。对高阻的 RES 输入来说，这个上拉完全够用。
+ *---------------------------------------------------------------------------*/
 static void TFT_ParkPinsHigh(void)
 {
     GPIO_InitTypeDef gi = {0};
@@ -346,24 +365,21 @@ static void TFT_ParkPinsHigh(void)
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOE_CLK_ENABLE();
 
-    gi.Mode  = GPIO_MODE_OUTPUT_PP;
-    gi.Pull  = GPIO_NOPULL;
-    gi.Speed = GPIO_SPEED_FREQ_LOW;      /* 备份域的脚跑不快，用低速档 */
+    gi.Mode  = GPIO_MODE_INPUT;
+    gi.Pull  = GPIO_PULLUP;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
 
     /* GPIOE: PE2 PE3 PE4 PE5 PE6 */
     gi.Pin = GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6;
     HAL_GPIO_Init(GPIOE, &gi);
-    HAL_GPIO_WritePin(GPIOE, gi.Pin, GPIO_PIN_SET);
 
     /* GPIOC: PC0 PC1 PC2 PC13（PC3=MOSI / PC14=DC / PC15=CS 不能用） */
     gi.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_13;
     HAL_GPIO_Init(GPIOC, &gi);
-    HAL_GPIO_WritePin(GPIOC, gi.Pin, GPIO_PIN_SET);
 
     /* GPIOB: PB13 PB15（PB10=SCK 不能用） */
     gi.Pin = GPIO_PIN_13 | GPIO_PIN_15;
     HAL_GPIO_Init(GPIOB, &gi);
-    HAL_GPIO_WritePin(GPIOB, gi.Pin, GPIO_PIN_SET);
 }
 
 static void TFT_Init(void)
@@ -716,7 +732,87 @@ static void Demo_MovingBox(void)
 }
 
 /*==============================================================================
- *                         九、Error_Handler（只为满足工程里的引用）
+ *                         九、静态保持诊断（RUN_DIAG = 1）
+ *
+ *   目的：把「闪几个颜色就白」这个模糊现象，变成三个可以回答的问题。
+ *
+ *   问题 1：面板在「不写数据」的时候，会不会自己变白？
+ *           填一次红色，然后 30 秒什么都不做，每秒打一个点。
+ *           · 30 秒后还是红的  -> 面板不会自己复位，复位是被"写操作"触发的
+ *           · 几秒后变白        -> 面板会自己复位（RES 悬空 / 供电不稳）
+ *
+ *   问题 2：变白之后，面板还认不认之前的初始化？
+ *           不重新初始化，直接再填一次绿色。
+ *           · 变绿 -> 面板还在初始化状态，我们的写操作是好的
+ *           · 还是白 -> 面板丢了初始化（被复位过）
+ *
+ *   问题 3：重新初始化能不能救回来？
+ *           重新 init 后填蓝色。
+ *           · 变蓝 -> 能救 -> 说明就是"被复位"，只要每步重新 init 就能一直跑
+ *
+ *   跑完这三个问题，再进入慢速彩色循环（每色 2 秒，每次都重新 init），
+ *   这时候如果一直正常，就说明"每步重新 init"这个策略是有效的。
+ *============================================================================*/
+static void Diag_Static(void)
+{
+    uint16_t i;
+
+    U_LOG("\r\n########## DIAG START ##########\r\n");
+
+    /* ---------------- 问题 1 ---------------- */
+    TFT_Init();
+    TFT_ClearAll(C_BLACK);
+    TFT_Fill(C_RED);
+
+    U_LOG("[Q1] RED shown, then 30 s of NOTHING.\r\n");
+    U_LOG("     watch: does it turn WHITE by itself ?\r\n");
+    for (i = 0; i < 30; i++)
+    {
+        U_LOG(".");
+        HAL_Delay(1000);
+    }
+    U_LOG("\r\n[Q1] 30 s done.\r\n");
+    U_LOG("     still RED  -> panel does NOT self-reset\r\n");
+    U_LOG("     WHITE      -> panel self-reset (RES / power)\r\n");
+
+    /* ---------------- 问题 2 ---------------- */
+    TFT_Fill(C_GREEN);            /* 故意不重新初始化 */
+    U_LOG("[Q2] GREEN sent WITHOUT re-init. 10 s ...\r\n");
+    for (i = 0; i < 10; i++)
+    {
+        U_LOG(".");
+        HAL_Delay(1000);
+    }
+    U_LOG("\r\n[Q2] turned GREEN -> panel still initialised, our writes are fine\r\n");
+    U_LOG("     stayed WHITE -> panel lost its init (it was reset)\r\n");
+
+    /* ---------------- 问题 3 ---------------- */
+    TFT_Init();
+    TFT_Fill(C_BLUE);
+    U_LOG("[Q3] BLUE after RE-INIT. 10 s ...\r\n");
+    for (i = 0; i < 10; i++)
+    {
+        U_LOG(".");
+        HAL_Delay(1000);
+    }
+    U_LOG("\r\n[Q3] turned BLUE -> re-init recovers it\r\n");
+    U_LOG("     still WHITE -> re-init does NOT recover it\r\n");
+
+    /* ---------------- 慢速循环 ---------------- */
+    U_LOG("\r\n[LOOP] slow colours, re-init every time (2 s each)\r\n");
+
+    while (1)
+    {
+        TFT_Init();  TFT_Fill(C_RED);    U_LOG("R");  HAL_Delay(2000);
+        TFT_Init();  TFT_Fill(C_GREEN);  U_LOG("G");  HAL_Delay(2000);
+        TFT_Init();  TFT_Fill(C_BLUE);   U_LOG("B");  HAL_Delay(2000);
+        TFT_Init();  TFT_Fill(C_WHITE);  U_LOG("W");  HAL_Delay(2000);
+        TFT_Init();  TFT_Fill(C_BLACK);  U_LOG("K");  HAL_Delay(2000);
+    }
+}
+
+/*==============================================================================
+ *                         十、Error_Handler（只为满足工程里的引用）
  *============================================================================*/
 void Error_Handler(void)
 {
@@ -748,6 +844,9 @@ int main(void)
     TFT_Init();
     TFT_ClearAll(C_BLACK);            /* 先清整个显存，消掉边缘杂色 */
 
+#if RUN_DIAG
+    Diag_Static();                    /* 诊断模式，永不返回 */
+#else
     /* ★ 每一段演示前都重新初始化一次。
      *   成本只有 0.4 秒，但换来一个巨大的好处：
      *   万一面板被噪声复位了（RES 悬空 / 电源波动），下一段会自动救回来，
@@ -783,4 +882,5 @@ int main(void)
         TFT_Init();
         Demo_Counter();               /* 计数器放在最后，会一直跑 */
     }
+#endif
 }
